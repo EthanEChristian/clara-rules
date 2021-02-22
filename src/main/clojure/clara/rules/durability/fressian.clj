@@ -47,7 +47,13 @@
             WeakHashMap]
            [java.io
             InputStream
-            OutputStream]))
+            OutputStream ByteArrayOutputStream ByteArrayInputStream]
+           [clara.rules.platform
+            GenericCache]
+           [clara.rules.compiler
+            Rulebase]
+           [java.security
+            MessageDigest]))
 
 ;; Use this map to cache the symbol for the map->RecordNameHere
 ;; factory function created for every Clojure record to improve
@@ -524,7 +530,10 @@
 ;;;; Session serializer.
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(defrecord FressianSessionSerializer [in-stream out-stream]
+(def ^:private digest-algorithm "MD5")
+(def ^:private clara-serde-version 2)
+
+(defrecord FressianSessionSerializer [in-stream out-stream cache]
   d/ISessionSerializer
   (serialize [_ session opts]
     (let [{:keys [rulebase memory]} (eng/components session)
@@ -537,14 +546,37 @@
                           :activation-group-fn nil
                           :get-alphas-fn nil
                           :node-expr-fn-lookup nil)
+          rulebase? #(instance? Rulebase %)
+          ->digest (fn [^bytes src-bytes]
+                     (let [md (MessageDigest/getInstance digest-algorithm)]
+                       (.update md src-bytes)
+                       (let [sb (StringBuilder.)]
+                         (doseq [b (.digest md)]
+                           (.append sb (format "%02x" (bit-and b 0xff))))
+                         (.toString sb))))
           record-holder (IdentityHashMap.)
           do-serialize
           (fn [sources]
             (with-open [^FressianWriter wtr
                         (fres/create-writer out-stream :handlers write-handler-lookup)]
+              ;; write serde version to compare to on deserialization
+              (fres/write-object wtr clara-serde-version)
               (pform/thread-local-binding [d/node-id->node-cache (volatile! {})
                                            d/clj-struct-holder record-holder]
-                                          (doseq [s sources] (fres/write-object wtr s)))))]
+                                          (doseq [s sources]
+                                            (if (rulebase? s)
+                                              ;; Handling the Rulebase differently to allow caching
+                                              (let [baos (ByteArrayOutputStream.)]
+                                                (with-open [^FressianWriter rulebase-wtr
+                                                            (fres/create-writer baos :handlers write-handler-lookup)]
+                                                  (fres/write-object rulebase-wtr s))
+                                                (let [rulebase-bytes (.toByteArray baos)
+                                                      digest (->digest rulebase-bytes)]
+                                                  ;; write the digest to the final stream
+                                                  (fres/write-object wtr digest)
+                                                  ;; append the rulebase to the final stream
+                                                  (fres/write-object wtr rulebase-bytes)))
+                                              (fres/write-object wtr s))))))]
       
       ;; In this case there is nothing to do with memory, so just serialize immediately.
       (if (:rulebase-only? opts)
@@ -571,7 +603,13 @@
 
     (with-open [^FressianReader rdr (fres/create-reader in-stream :handlers read-handler-lookup)]
       (let [{:keys [rulebase-only? base-rulebase forms-per-eval]} opts
-            
+
+            ;; Asserting that the the current version of clara's serde is compatible with that of the session being deserialized
+            ;; Not applicable to versions prior to clara-rules-0.21.0
+            _ (let [sessions-version (fres/read-object rdr)]
+                (when-not (= sessions-version clara-serde-version)
+                  (throw (ex-info "Clara serde version mismatch" {:current-version clara-serde-version :sessions-version sessions-version}))))
+
             record-holder (ArrayList.)
             ;; The rulebase should either be given from the base-session or found in
             ;; the restored session-state.
@@ -593,12 +631,23 @@
                        (let [without-opts-rulebase
                              (pform/thread-local-binding [d/node-id->node-cache (volatile! {})
                                                           d/clj-struct-holder record-holder]
-                                                         (pform/thread-local-binding [d/node-fn-cache (-> (fres/read-object rdr)
-                                                                                                          reconstruct-expressions
-                                                                                                          (com/compile-exprs forms-per-eval))]
-                                                                                     (assoc (fres/read-object rdr)
-                                                                                       :node-expr-fn-lookup
-                                                                                       (.get d/node-fn-cache))))]
+                                                         (let [node-expr-fn-lookup (fres/read-object rdr)
+                                                               digest (fres/read-object rdr)
+                                                               rulebase-bytes (ByteArrayInputStream. (fres/read-object rdr))]
+                                                           (if-let [maybe-cached-rulebase (pform/get-cached cache digest)]
+                                                             maybe-cached-rulebase
+                                                             (let [uncached-rulebase
+                                                                   (pform/thread-local-binding [d/node-fn-cache (-> node-expr-fn-lookup
+                                                                                                                    reconstruct-expressions
+                                                                                                                    (com/compile-exprs forms-per-eval))]
+                                                                                               (assoc
+                                                                                                 (with-open
+                                                                                                   [^FressianReader rulebase-rdr (fres/create-reader rulebase-bytes :handlers read-handler-lookup)]
+                                                                                                   (fres/read-object rulebase-rdr))
+                                                                                                 :node-expr-fn-lookup
+                                                                                                 (.get d/node-fn-cache)))]
+                                                               (pform/add-cache cache digest uncached-rulebase)
+                                                               uncached-rulebase))))]
                          (d/rulebase->rulebase-with-opts without-opts-rulebase opts)))]
         
         (if rulebase-only?
@@ -632,10 +681,19 @@
   ([in-or-out-stream :- (s/pred (some-fn #(instance? InputStream %)
                                          #(instance? OutputStream %))
                                 "java.io.InputStream or java.io.OutputStream")]
-   (if (instance? InputStream in-or-out-stream)
-     (create-session-serializer in-or-out-stream nil)
-     (create-session-serializer nil in-or-out-stream)))
+    (create-session-serializer in-or-out-stream pform/no-op-cache))
+
+  ([in-or-out-stream :- (s/pred (some-fn #(instance? InputStream %)
+                                         #(instance? OutputStream %))
+                                "java.io.InputStream or java.io.OutputStream")
+    cache  ;; Satisfies pform/GenericCache
+    ]
+    (if (instance? InputStream in-or-out-stream)
+      (create-session-serializer in-or-out-stream nil cache)
+      (create-session-serializer nil in-or-out-stream cache)))
 
   ([in-stream :- (s/maybe InputStream)
-    out-stream :- (s/maybe OutputStream)]
-   (->FressianSessionSerializer in-stream out-stream)))
+    out-stream :- (s/maybe OutputStream)
+    cache ;; Satisfies pform/GenericCache
+    ]
+    (->FressianSessionSerializer in-stream out-stream cache)))

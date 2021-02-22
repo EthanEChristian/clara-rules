@@ -113,3 +113,17 @@
   "A for wrapped with a doall to force realisation. Usage is the same as regular for."
   [& body]
   `(doall (for ~@body)))
+
+(defprotocol GenericCache
+  "A protocol for cache like behavior in clara"
+  (get-cached [this cache-key] "retrieve the cached value")
+  (add-cache [this cache-key obj] "add the obj to the cache"))
+
+(defrecord NoOpCache []
+  GenericCache
+  (get-cached [_ _] nil)
+  (add-cache [_ _ _]))
+
+(def no-op-cache
+  "A common cache that is intended as a placeholder in the event that consumers do not provide a caching strategy"
+  (->NoOpCache))
