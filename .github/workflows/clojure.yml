@@ -31,9 +31,7 @@ jobs:
     - name: Install Chrome
       run: |
          npx puppeteer browsers install chrome
-         uname -r
-         ls ~/.cache/puppeteer/chrome/
-         cd ~/.cache/puppeteer/chrome/linux-<version>/chrome-linux64/
+         cd ~/.cache/puppeteer/chrome/linux-*/chrome-linux64/
          sudo chown root:root chrome_sandbox
          sudo chmod 4755 chrome_sandbox
          # copy sandbox executable to a shared location
